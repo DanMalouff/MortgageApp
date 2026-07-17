@@ -1,0 +1,16 @@
+{
+  "name": "Stepdown — Temporary Buydown Calculator",
+  "short_name": "Stepdown",
+  "description": "Mortgage temporary buydown calculator: presets and custom schedules, subsidy cost, seller-credit limits, PITI, and comparisons against points or a price cut.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FAFBF7",
+  "theme_color": "#2E6E4E",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
