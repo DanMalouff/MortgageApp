@@ -1,0 +1,1034 @@
+import React, { useState, useEffect, useRef, useCallback } from "react";
+
+/* ============================================================
+   BOWLING POKER — multiplayer 5-card draw for league night
+   Each bowler joins from their own phone with a game code.
+   Strike = card + "Great job" | Spare = card + "So average"
+   Open = no card + "You suck" | Finish = fireworks for winner
+   ============================================================ */
+
+const SUITS = [
+  { s: 0, sym: "♠", color: "#1b1f2a" },
+  { s: 1, sym: "♥", color: "#c8323e" },
+  { s: 2, sym: "♦", color: "#c8323e" },
+  { s: 3, sym: "♣", color: "#1b1f2a" },
+];
+const RANKS = [14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2];
+const RNAME = { 14: "A", 13: "K", 12: "Q", 11: "J", 10: "10", 9: "9", 8: "8", 7: "7", 6: "6", 5: "5", 4: "4", 3: "3", 2: "2" };
+
+const key = (c) => c.r + "-" + c.s;
+const uid = () => Math.random().toString(36).slice(2, 10);
+const makeCode = () => {
+  const A = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let s = "";
+  for (let i = 0; i < 4; i++) s += A[Math.floor(Math.random() * A.length)];
+  return s;
+};
+
+function fullDeck(decks) {
+  const out = [];
+  for (let d = 0; d < decks; d++)
+    for (const su of SUITS) for (const r of RANKS) out.push({ r, s: su.s });
+  return out;
+}
+
+/* ---------------- audio ---------------- */
+let _ctx = null;
+function ac() {
+  try {
+    _ctx = _ctx || new (window.AudioContext || window.webkitAudioContext)();
+    if (_ctx.state === "suspended") _ctx.resume();
+    return _ctx;
+  } catch (e) {
+    return null;
+  }
+}
+function say(text) {
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.95;
+    u.pitch = 1;
+    window.speechSynthesis.speak(u);
+  } catch (e) {}
+}
+function crowdCheer() {
+  const c = ac();
+  if (!c) return;
+  const dur = 7;
+  // swelling crowd roar
+  const buf = c.createBuffer(1, c.sampleRate * dur, c.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) {
+    const env = Math.pow(Math.sin((Math.PI * i) / d.length), 0.6);
+    d[i] = (Math.random() * 2 - 1) * env;
+  }
+  const src = c.createBufferSource();
+  src.buffer = buf;
+  const f = c.createBiquadFilter();
+  f.type = "bandpass";
+  f.frequency.value = 900;
+  f.Q.value = 0.4;
+  const g = c.createGain();
+  g.gain.setValueAtTime(0.0001, c.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.55, c.currentTime + 0.7);
+  g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
+  src.connect(f);
+  f.connect(g);
+  g.connect(c.destination);
+  src.start();
+  // scattered claps and whistles
+  for (let i = 0; i < 90; i++) {
+    const t = c.currentTime + Math.random() * dur * 0.85;
+    const b = c.createBuffer(1, Math.floor(c.sampleRate * 0.05), c.sampleRate);
+    const dd = b.getChannelData(0);
+    for (let j = 0; j < dd.length; j++) dd[j] = (Math.random() * 2 - 1) * Math.exp((-j / dd.length) * 9);
+    const s2 = c.createBufferSource();
+    s2.buffer = b;
+    const hp = c.createBiquadFilter();
+    hp.type = "highpass";
+    hp.frequency.value = 1400;
+    const gg = c.createGain();
+    gg.gain.value = 0.18 + Math.random() * 0.14;
+    s2.connect(hp);
+    hp.connect(gg);
+    gg.connect(c.destination);
+    s2.start(t);
+  }
+  for (let i = 0; i < 6; i++) {
+    const t = c.currentTime + 0.5 + Math.random() * 4.5;
+    const o = c.createOscillator();
+    o.type = "sine";
+    o.frequency.setValueAtTime(1800 + Math.random() * 600, t);
+    o.frequency.exponentialRampToValueAtTime(2600 + Math.random() * 500, t + 0.25);
+    const gw = c.createGain();
+    gw.gain.setValueAtTime(0.0001, t);
+    gw.gain.exponentialRampToValueAtTime(0.06, t + 0.05);
+    gw.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+    o.connect(gw);
+    gw.connect(c.destination);
+    o.start(t);
+    o.stop(t + 0.4);
+  }
+}
+function fireworkPop() {
+  const c = ac();
+  if (!c) return;
+  const t = c.currentTime;
+  const b = c.createBuffer(1, Math.floor(c.sampleRate * 0.3), c.sampleRate);
+  const dd = b.getChannelData(0);
+  for (let j = 0; j < dd.length; j++) dd[j] = (Math.random() * 2 - 1) * Math.exp((-j / dd.length) * 6);
+  const s = c.createBufferSource();
+  s.buffer = b;
+  const lp = c.createBiquadFilter();
+  lp.type = "lowpass";
+  lp.frequency.value = 500 + Math.random() * 900;
+  const g = c.createGain();
+  g.gain.value = 0.35;
+  s.connect(lp);
+  lp.connect(g);
+  g.connect(c.destination);
+  s.start(t);
+}
+
+/* ---------------- hand evaluation ---------------- */
+const cmpScore = (a, b) => {
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a[i] || 0, y = b[i] || 0;
+    if (x !== y) return x - y;
+  }
+  return 0;
+};
+
+function evalCombo(cards, wildSet, rule) {
+  const n = cards.length;
+  const naturals = cards.filter((c) => !wildSet.has(key(c)));
+  const w = n - naturals.length;
+  const cnt = {};
+  naturals.forEach((c) => (cnt[c.r] = (cnt[c.r] || 0) + 1));
+  const entries = Object.keys(cnt)
+    .map((r) => [+r, cnt[r]])
+    .sort((a, b) => b[1] - a[1] || b[0] - a[0]);
+  const distinct = entries.length;
+  const natRanks = naturals.map((c) => c.r);
+  const suitSet = new Set(naturals.map((c) => c.s));
+  const flushOK = n === 5 && suitSet.size <= 1;
+
+  let straightHigh = 0;
+  if (n === 5 && distinct === naturals.length) {
+    for (let high = 14; high >= 5; high--) {
+      const win = new Set();
+      for (let k2 = 0; k2 < 5; k2++) {
+        let r = high - k2;
+        if (r === 1) r = 14;
+        win.add(r);
+      }
+      if (natRanks.every((r) => win.has(r))) {
+        straightHigh = high;
+        break;
+      }
+    }
+  }
+  const royal = flushOK && straightHigh === 14;
+  const fiveOK = n === 5 && distinct <= 1;
+  const fiveRank = fiveOK ? (distinct === 1 ? entries[0][0] : 14) : 0;
+
+  const restKickers = (exclRank, used) => {
+    const rest = natRanks.filter((r) => r !== exclRank).sort((a, b) => b - a);
+    return rest;
+  };
+
+  // rule-dependent top tier
+  if (rule === "naturalRoyal") {
+    if (royal && w === 0) return { s: [12], name: "Natural Royal Flush" };
+    if (fiveOK) return { s: [11, fiveRank], name: "Five of a Kind — " + RNAME[fiveRank] + "s" };
+    if (royal) return { s: [10], name: "Royal Flush (wild)" };
+  } else {
+    if (fiveOK) return { s: [11, fiveRank], name: "Five of a Kind — " + RNAME[fiveRank] + "s" };
+    if (royal) return { s: [10], name: "Royal Flush" };
+  }
+  if (flushOK && straightHigh > 0)
+    return { s: [9, straightHigh], name: "Straight Flush, " + RNAME[straightHigh] + " high" };
+
+  // quads
+  if (n >= 4) {
+    for (const r of RANKS) {
+      const c = Math.min(cnt[r] || 0, 4);
+      if (c + w >= 4 && (c > 0 || w >= 4)) {
+        const used = Math.max(0, 4 - c);
+        const leftoverW = w - used;
+        const rest = natRanks.filter((x) => x !== r).sort((a, b) => b - a);
+        const kick = leftoverW > 0 ? 14 : rest[0] || 0;
+        return { s: [8, r, kick], name: "Four of a Kind — " + RNAME[r] + "s" };
+      }
+    }
+  }
+  // full house
+  if (n === 5 && distinct >= 2) {
+    let best = null;
+    for (const [a, ca] of entries)
+      for (const [b, cb] of entries) {
+        if (a === b) continue;
+        const need = Math.max(0, 3 - ca) + Math.max(0, 2 - cb);
+        if (need <= w) {
+          const sc = [7, a, b];
+          if (!best || cmpScore(sc, best.s) > 0) best = { s: sc, name: "Full House — " + RNAME[a] + "s over " + RNAME[b] + "s" };
+        }
+      }
+    if (best) return best;
+  }
+  if (flushOK) {
+    const tb = [...natRanks, ...Array(w).fill(14)].sort((a, b) => b - a);
+    return { s: [6, ...tb], name: "Flush, " + RNAME[tb[0]] + " high" };
+  }
+  if (straightHigh > 0) return { s: [5, straightHigh], name: "Straight, " + RNAME[straightHigh] + " high" };
+  // trips
+  if (n >= 3) {
+    for (const r of RANKS) {
+      const c = cnt[r] || 0;
+      if (c + w >= 3 && (c > 0 || w >= 3)) {
+        const rest = natRanks.filter((x) => x !== r).sort((a, b) => b - a);
+        return { s: [4, r, ...rest.slice(0, 2)], name: "Three of a Kind — " + RNAME[r] + "s" };
+      }
+    }
+  }
+  // two pair (naturals only; a wild would have made trips)
+  if (distinct >= 2 && entries[0][1] >= 2 && entries[1][1] >= 2) {
+    const rest = natRanks.filter((x) => x !== entries[0][0] && x !== entries[1][0]).sort((a, b) => b - a);
+    return {
+      s: [3, entries[0][0], entries[1][0], rest[0] || 0],
+      name: "Two Pair — " + RNAME[entries[0][0]] + "s & " + RNAME[entries[1][0]] + "s",
+    };
+  }
+  // pair
+  if (n >= 2) {
+    for (const r of RANKS) {
+      const c = cnt[r] || 0;
+      if (c + w >= 2 && (c > 0 || w >= 2)) {
+        const rest = natRanks.filter((x) => x !== r).sort((a, b) => b - a);
+        return { s: [2, r, ...rest.slice(0, 3)], name: "Pair of " + RNAME[r] + "s" };
+      }
+    }
+  }
+  const tb = natRanks.sort((a, b) => b - a);
+  return { s: [1, ...tb], name: tb.length ? RNAME[tb[0]] + " high" : "No cards" };
+}
+
+function* combos(arr, k) {
+  const n = arr.length;
+  if (k > n) return;
+  const idx = Array.from({ length: k }, (_, i) => i);
+  while (true) {
+    yield idx.map((i) => arr[i]);
+    let i = k - 1;
+    while (i >= 0 && idx[i] === n - k + i) i--;
+    if (i < 0) return;
+    idx[i]++;
+    for (let j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+  }
+}
+
+function bestHand(cards, wildSet, rule) {
+  if (!cards.length) return { s: [0], name: "No cards", five: [] };
+  const k = Math.min(5, cards.length);
+  let best = null;
+  for (const c5 of combos(cards, k)) {
+    const r = evalCombo(c5, wildSet, rule);
+    if (!best || cmpScore(r.s, best.s) > 0) best = { ...r, five: c5 };
+  }
+  return best;
+}
+
+/* ---------------- storage ---------------- */
+async function sGet(k) {
+  try {
+    const r = await window.storage.get(k, true);
+    return r ? JSON.parse(r.value) : null;
+  } catch (e) {
+    return null;
+  }
+}
+async function sSet(k, v) {
+  try {
+    await window.storage.set(k, JSON.stringify(v), true);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+const metaKey = (code) => "bpkr:" + code + ":meta";
+const playerKey = (code, id) => "bpkr:" + code + ":p:" + id;
+
+/* ---------------- fireworks ---------------- */
+function Fireworks() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current;
+    const ctx = cv.getContext("2d");
+    let W = (cv.width = window.innerWidth);
+    let H = (cv.height = window.innerHeight);
+    let parts = [];
+    let alive = true;
+    const colors = ["#ffd447", "#ff5c8a", "#5cc8ff", "#7dffa0", "#ffffff", "#ff9d47"];
+    function burst() {
+      const x = W * (0.15 + Math.random() * 0.7);
+      const y = H * (0.12 + Math.random() * 0.45);
+      const col = colors[Math.floor(Math.random() * colors.length)];
+      const N = 60 + Math.floor(Math.random() * 40);
+      for (let i = 0; i < N; i++) {
+        const a = (Math.PI * 2 * i) / N + Math.random() * 0.2;
+        const v = 1.5 + Math.random() * 3.5;
+        parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 60 + Math.random() * 30, col });
+      }
+      fireworkPop();
+    }
+    const iv = setInterval(() => alive && burst(), 700);
+    burst();
+    function tick() {
+      if (!alive) return;
+      ctx.fillStyle = "rgba(8,10,18,0.22)";
+      ctx.fillRect(0, 0, W, H);
+      parts = parts.filter((p) => p.life > 0);
+      for (const p of parts) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.04;
+        p.vx *= 0.985;
+        p.vy *= 0.985;
+        p.life--;
+        ctx.globalAlpha = Math.max(0, p.life / 70);
+        ctx.fillStyle = p.col;
+        ctx.fillRect(p.x, p.y, 2.6, 2.6);
+      }
+      ctx.globalAlpha = 1;
+      requestAnimationFrame(tick);
+    }
+    tick();
+    const onR = () => {
+      W = cv.width = window.innerWidth;
+      H = cv.height = window.innerHeight;
+    };
+    window.addEventListener("resize", onR);
+    const stop = setTimeout(() => {
+      alive = false;
+      clearInterval(iv);
+    }, 14000);
+    return () => {
+      alive = false;
+      clearInterval(iv);
+      clearTimeout(stop);
+      window.removeEventListener("resize", onR);
+    };
+  }, []);
+  return (
+    <canvas
+      ref={ref}
+      style={{ position: "fixed", inset: 0, zIndex: 40, pointerEvents: "none" }}
+    />
+  );
+}
+
+/* ---------------- card ---------------- */
+function PCard({ c, wild, small, onClick, selected }) {
+  const su = SUITS[c.s];
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        width: small ? 44 : 58,
+        height: small ? 62 : 82,
+        borderRadius: 8,
+        background: "#fdfaf2",
+        border: wild ? "2px solid #ffd447" : "1px solid #b9b2a4",
+        boxShadow: selected ? "0 0 0 3px #ff5c8a" : "0 2px 4px rgba(0,0,0,0.35)",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        color: su.color,
+        fontWeight: 800,
+        fontSize: small ? 15 : 19,
+        lineHeight: 1.05,
+        cursor: onClick ? "pointer" : "default",
+        position: "relative",
+        userSelect: "none",
+        flexShrink: 0,
+      }}
+    >
+      <div>{RNAME[c.r]}</div>
+      <div style={{ fontSize: small ? 17 : 22 }}>{su.sym}</div>
+      {wild && (
+        <div style={{ position: "absolute", top: 1, right: 3, fontSize: 10, color: "#b8860b" }}>★</div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- big alley button ---------------- */
+function AlleyBtn({ label, sub, color, onClick, disabled }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        flex: 1,
+        minWidth: 90,
+        padding: "18px 8px",
+        borderRadius: 14,
+        border: "none",
+        background: disabled ? "#3a4152" : color,
+        color: "#fff",
+        fontSize: 20,
+        fontWeight: 900,
+        letterSpacing: 1,
+        textTransform: "uppercase",
+        boxShadow: disabled ? "none" : "0 4px 0 rgba(0,0,0,0.4)",
+        opacity: disabled ? 0.5 : 1,
+        cursor: disabled ? "default" : "pointer",
+      }}
+    >
+      {label}
+      <div style={{ fontSize: 11, fontWeight: 600, opacity: 0.85, textTransform: "none", marginTop: 3 }}>{sub}</div>
+    </button>
+  );
+}
+
+/* ============================================================ */
+export default function App() {
+  const [screen, setScreen] = useState("home"); // home | create | join | game
+  const [myId] = useState(uid);
+  const [myName, setMyName] = useState("");
+  const [code, setCode] = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [meta, setMeta] = useState(null);
+  const [me, setMe] = useState(null);
+  const [others, setOthers] = useState({});
+  const [pendingDiscard, setPendingDiscard] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [hallOfFame, setHallOfFame] = useState([]);
+  const finishedHandled = useRef(false);
+
+  // create-game settings
+  const [decks, setDecks] = useState(1);
+  const [maxPlayers, setMaxPlayers] = useState(6);
+  const [holdMode, setHoldMode] = useState("keep12");
+  const [rankRule, setRankRule] = useState("fiveBeatsAll");
+  const [wilds, setWilds] = useState([]); // array of "r-s"
+
+  const wildSet = new Set(meta ? meta.wilds : wilds);
+
+  /* ---- hall of fame on home ---- */
+  useEffect(() => {
+    if (screen === "home") sGet("bpkr:winners").then((v) => setHallOfFame(Array.isArray(v) ? v.slice(-5).reverse() : []));
+  }, [screen]);
+
+  /* ---- polling ---- */
+  const poll = useCallback(async () => {
+    if (!code) return;
+    const m = await sGet(metaKey(code));
+    if (!m) return;
+    setMeta(m);
+    const out = {};
+    await Promise.all(
+      (m.playerIds || []).map(async (pid) => {
+        if (pid === myId) return;
+        const p = await sGet(playerKey(code, pid));
+        if (p) out[pid] = p;
+      })
+    );
+    setOthers(out);
+  }, [code, myId]);
+
+  useEffect(() => {
+    if (screen !== "game") return;
+    poll();
+    const iv = setInterval(poll, 2500);
+    return () => clearInterval(iv);
+  }, [screen, poll]);
+
+  /* ---- finish reactions ---- */
+  useEffect(() => {
+    if (!meta || meta.status !== "finished" || finishedHandled.current) return;
+    finishedHandled.current = true;
+    if (meta.winnerId === myId) {
+      crowdCheer();
+    } else {
+      say("Loser");
+    }
+  }, [meta, myId]);
+
+  /* ---- helpers ---- */
+  const saveMe = async (next) => {
+    setMe(next);
+    await sSet(playerKey(code, myId), next);
+  };
+
+  const allUsed = () => {
+    const used = [];
+    if (me) used.push(...me.cards, ...me.discards);
+    Object.values(others).forEach((p) => used.push(...(p.cards || []), ...(p.discards || [])));
+    return used;
+  };
+
+  const drawCard = () => {
+    const counts = {};
+    allUsed().forEach((c) => (counts[key(c)] = (counts[key(c)] || 0) + 1));
+    const pool = fullDeck(meta.decks).filter((c) => {
+      if ((counts[key(c)] || 0) > 0) {
+        counts[key(c)]--;
+        return false;
+      }
+      return true;
+    });
+    if (!pool.length) return null;
+    return pool[Math.floor(Math.random() * pool.length)];
+  };
+
+  /* ---- create / join ---- */
+  const createGame = async () => {
+    if (!myName.trim()) return setMsg("Enter your name first");
+    setBusy(true);
+    const c = makeCode();
+    const m = {
+      code: c,
+      hostId: myId,
+      decks,
+      maxPlayers,
+      holdMode,
+      rankRule,
+      wilds,
+      playerIds: [myId],
+      names: { [myId]: myName.trim() },
+      status: "open",
+      created: Date.now(),
+    };
+    const p = { name: myName.trim(), cards: [], discards: [], strikes: 0, spares: 0, opens: 0 };
+    await sSet(metaKey(c), m);
+    await sSet(playerKey(c, myId), p);
+    setCode(c);
+    setMeta(m);
+    setMe(p);
+    finishedHandled.current = false;
+    setScreen("game");
+    setMsg("");
+    setBusy(false);
+  };
+
+  const joinGame = async () => {
+    if (!myName.trim()) return setMsg("Enter your name first");
+    const c = joinCode.trim().toUpperCase();
+    if (c.length !== 4) return setMsg("Game codes are 4 characters");
+    setBusy(true);
+    const m = await sGet(metaKey(c));
+    if (!m) {
+      setBusy(false);
+      return setMsg("No game found with code " + c);
+    }
+    if (m.status === "finished") {
+      setBusy(false);
+      return setMsg("That game already finished");
+    }
+    if (!m.playerIds.includes(myId) && m.playerIds.length >= m.maxPlayers) {
+      setBusy(false);
+      return setMsg("Game is full (" + m.maxPlayers + " bowlers)");
+    }
+    // add self with a verify-retry loop (shared storage is last-write-wins)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const fresh = await sGet(metaKey(c));
+      if (!fresh) break;
+      if (!fresh.playerIds.includes(myId)) {
+        fresh.playerIds = [...fresh.playerIds, myId];
+        fresh.names = { ...fresh.names, [myId]: myName.trim() };
+        await sSet(metaKey(c), fresh);
+        await new Promise((r) => setTimeout(r, 500));
+      } else {
+        setMeta(fresh);
+        break;
+      }
+    }
+    const p = { name: myName.trim(), cards: [], discards: [], strikes: 0, spares: 0, opens: 0 };
+    await sSet(playerKey(c, myId), p);
+    setCode(c);
+    setMe(p);
+    finishedHandled.current = false;
+    setScreen("game");
+    setMsg("");
+    setBusy(false);
+  };
+
+  /* ---- gameplay ---- */
+  const totalEarned = me ? me.cards.length + me.discards.length : 0;
+
+  const markBall = async (type) => {
+    ac(); // unlock audio on user gesture
+    if (!me || meta.status === "finished" || pendingDiscard) return;
+    if (type === "open") {
+      say("You suck");
+      await saveMe({ ...me, opens: me.opens + 1 });
+      return;
+    }
+    say(type === "strike" ? "Great job" : "So average");
+    const counted = { ...me, [type === "strike" ? "strikes" : "spares"]: me[type === "strike" ? "strikes" : "spares"] + 1 };
+    if (totalEarned >= 12) {
+      setMsg("Card limit reached — a bowling game only has 12 marks!");
+      await saveMe(counted);
+      return;
+    }
+    if (meta.holdMode === "discard5" && me.cards.length >= 5) {
+      setPendingDiscard(true);
+      setMe(counted);
+      await sSet(playerKey(code, myId), counted);
+      setMsg("Discard a card before you pick up your new one");
+      return;
+    }
+    const c = drawCard();
+    if (!c) {
+      setMsg("The deck is empty!");
+      await saveMe(counted);
+      return;
+    }
+    await saveMe({ ...me, ...counted, cards: [...me.cards, c] });
+    setMsg("");
+  };
+
+  const discardThenDraw = async (idx) => {
+    if (!pendingDiscard) return;
+    const disc = me.cards[idx];
+    const rest = me.cards.filter((_, i) => i !== idx);
+    const c = drawCard();
+    const next = { ...me, cards: c ? [...rest, c] : rest, discards: [...me.discards, disc] };
+    setPendingDiscard(false);
+    setMsg(c ? "New card picked up" : "Deck was empty — discard recorded");
+    await saveMe(next);
+  };
+
+  const finishGame = async () => {
+    if (!meta || meta.hostId !== myId) return;
+    setBusy(true);
+    // fresh read of everyone
+    const fresh = await sGet(metaKey(code));
+    const players = [];
+    for (const pid of fresh.playerIds) {
+      const p = pid === myId ? me : await sGet(playerKey(code, pid));
+      if (p) players.push({ id: pid, ...p });
+    }
+    const ws = new Set(fresh.wilds);
+    const results = players.map((p) => {
+      const bh = bestHand(p.cards, ws, fresh.rankRule);
+      return { id: p.id, name: p.name, handName: bh.name, score: bh.s, five: bh.five, cardCount: p.cards.length };
+    });
+    results.sort((a, b) => cmpScore(b.score, a.score));
+    const winner = results[0];
+    const done = { ...fresh, status: "finished", winnerId: winner.id, results, finishedAt: Date.now() };
+    await sSet(metaKey(code), done);
+    const hist = (await sGet("bpkr:winners")) || [];
+    hist.push({ code, winner: winner.name, hand: winner.handName, date: new Date().toLocaleDateString() });
+    await sSet("bpkr:winners", hist.slice(-50));
+    setMeta(done);
+    setBusy(false);
+  };
+
+  const resetToHome = () => {
+    setScreen("home");
+    setCode("");
+    setMeta(null);
+    setMe(null);
+    setOthers({});
+    setPendingDiscard(false);
+    setMsg("");
+    finishedHandled.current = false;
+  };
+
+  /* ---- shared styles ---- */
+  const page = {
+    minHeight: "100vh",
+    background: "linear-gradient(180deg,#0c1020 0%,#141b33 60%,#0c1020 100%)",
+    color: "#f2f0e8",
+    fontFamily: "'Trebuchet MS','Segoe UI',sans-serif",
+    padding: "16px 14px 40px",
+    maxWidth: 560,
+    margin: "0 auto",
+  };
+  const neon = {
+    fontFamily: "'Arial Black','Trebuchet MS',sans-serif",
+    fontSize: 26,
+    letterSpacing: 2,
+    textAlign: "center",
+    color: "#5cc8ff",
+    textShadow: "0 0 12px rgba(92,200,255,0.75), 0 0 30px rgba(92,200,255,0.35)",
+    margin: "6px 0 2px",
+  };
+  const neonPink = { ...neon, color: "#ff5c8a", textShadow: "0 0 12px rgba(255,92,138,0.75)", fontSize: 15, letterSpacing: 4 };
+  const cardBox = {
+    background: "rgba(255,255,255,0.05)",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 14,
+    padding: 14,
+    marginTop: 14,
+  };
+  const input = {
+    width: "100%",
+    padding: "13px 12px",
+    borderRadius: 10,
+    border: "1px solid #3a4152",
+    background: "#1b2238",
+    color: "#fff",
+    fontSize: 17,
+    boxSizing: "border-box",
+  };
+  const btn = (bg) => ({
+    width: "100%",
+    padding: "15px",
+    borderRadius: 12,
+    border: "none",
+    background: bg,
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: 800,
+    letterSpacing: 1,
+    marginTop: 12,
+    cursor: "pointer",
+    boxShadow: "0 4px 0 rgba(0,0,0,0.4)",
+  });
+  const chip = (on) => ({
+    padding: "9px 13px",
+    borderRadius: 20,
+    border: on ? "2px solid #5cc8ff" : "1px solid #3a4152",
+    background: on ? "rgba(92,200,255,0.18)" : "#1b2238",
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
+  });
+
+  const Header = () => (
+    <div style={{ marginBottom: 4 }}>
+      <div style={neonPink}>LEAGUE NIGHT</div>
+      <div style={neon}>🎳 BOWLING POKER ♠</div>
+    </div>
+  );
+
+  /* ================= HOME ================= */
+  if (screen === "home")
+    return (
+      <div style={page}>
+        <Header />
+        <div style={{ textAlign: "center", opacity: 0.75, fontSize: 14, marginTop: 6 }}>
+          Every bowler plays from their own phone. Strikes and spares earn cards — best poker hand at the end of the night wins.
+        </div>
+        <div style={cardBox}>
+          <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 6 }}>Your name</div>
+          <input style={input} value={myName} onChange={(e) => setMyName(e.target.value)} placeholder="e.g. Kingpin Kelly" maxLength={16} />
+          <button style={btn("#ff5c8a")} onClick={() => (myName.trim() ? (setMsg(""), setScreen("create")) : setMsg("Enter your name first"))}>
+            Start a new game
+          </button>
+          <button style={btn("#2f6fed")} onClick={() => (myName.trim() ? (setMsg(""), setScreen("join")) : setMsg("Enter your name first"))}>
+            Join with a code
+          </button>
+          {msg && <div style={{ color: "#ffd447", marginTop: 10, fontSize: 14 }}>{msg}</div>}
+        </div>
+        {hallOfFame.length > 0 && (
+          <div style={cardBox}>
+            <div style={{ fontWeight: 800, color: "#ffd447", marginBottom: 8 }}>🏆 Recent winners</div>
+            {hallOfFame.map((h, i) => (
+              <div key={i} style={{ fontSize: 14, padding: "4px 0", borderBottom: "1px solid rgba(255,255,255,0.07)" }}>
+                <b>{h.winner}</b> — {h.hand} <span style={{ opacity: 0.6 }}>({h.date})</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{ fontSize: 11, opacity: 0.5, marginTop: 18, textAlign: "center" }}>
+          Games and winners are stored in shared storage visible to everyone using this app.
+        </div>
+      </div>
+    );
+
+  /* ================= CREATE ================= */
+  if (screen === "create") {
+    const toggleCard = (k2) => setWilds((w) => (w.includes(k2) ? w.filter((x) => x !== k2) : [...w, k2]));
+    const toggleRank = (r) => {
+      const ks = SUITS.map((su) => r + "-" + su.s);
+      const allOn = ks.every((k2) => wilds.includes(k2));
+      setWilds((w) => (allOn ? w.filter((x) => !ks.includes(x)) : [...new Set([...w, ...ks])]));
+    };
+    return (
+      <div style={page}>
+        <Header />
+        <div style={cardBox}>
+          <div style={{ fontWeight: 800, marginBottom: 10 }}>Game setup</div>
+
+          <div style={{ fontSize: 13, opacity: 0.7 }}>Bowlers (2–10)</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", margin: "6px 0 14px" }}>
+            {[2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+              <button key={n} style={chip(maxPlayers === n)} onClick={() => setMaxPlayers(n)}>{n}</button>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 13, opacity: 0.7 }}>Decks (1–4)</div>
+          <div style={{ display: "flex", gap: 6, margin: "6px 0 14px" }}>
+            {[1, 2, 3, 4].map((n) => (
+              <button key={n} style={chip(decks === n)} onClick={() => setDecks(n)}>{n}</button>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 13, opacity: 0.7 }}>Hand size</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, margin: "6px 0 14px" }}>
+            <button style={chip(holdMode === "keep12")} onClick={() => setHoldMode("keep12")}>
+              Keep up to 12 cards — best 5 picked automatically at the end
+            </button>
+            <button style={chip(holdMode === "discard5")} onClick={() => setHoldMode("discard5")}>
+              Max 5 in hand — discard before picking up the 6th card
+            </button>
+          </div>
+
+          <div style={{ fontSize: 13, opacity: 0.7 }}>Five of a Kind vs Royal Flush</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, margin: "6px 0 14px" }}>
+            <button style={chip(rankRule === "fiveBeatsAll")} onClick={() => setRankRule("fiveBeatsAll")}>
+              Five of a Kind beats every Royal Flush
+            </button>
+            <button style={chip(rankRule === "naturalRoyal")} onClick={() => setRankRule("naturalRoyal")}>
+              Natural Royal beats Five of a Kind; Five of a Kind beats wild Royals
+            </button>
+          </div>
+
+          <div style={{ fontSize: 13, opacity: 0.7 }}>
+            Wild cards — tap a rank letter for the whole rank, or tap individual cards ({wilds.length} wild{wilds.length === 1 ? "" : "s"}; leave empty for no wilds)
+          </div>
+          <div style={{ overflowX: "auto", margin: "8px 0 4px" }}>
+            {RANKS.map((r) => (
+              <div key={r} style={{ display: "flex", gap: 4, alignItems: "center", marginBottom: 4 }}>
+                <button
+                  onClick={() => toggleRank(r)}
+                  style={{ ...chip(SUITS.every((su) => wilds.includes(r + "-" + su.s))), padding: "6px 10px", minWidth: 40 }}
+                >
+                  {RNAME[r]}
+                </button>
+                {SUITS.map((su) => {
+                  const k2 = r + "-" + su.s;
+                  const on = wilds.includes(k2);
+                  return (
+                    <button
+                      key={k2}
+                      onClick={() => toggleCard(k2)}
+                      style={{
+                        width: 40, height: 34, borderRadius: 8, fontSize: 15, fontWeight: 800, cursor: "pointer",
+                        border: on ? "2px solid #ffd447" : "1px solid #3a4152",
+                        background: on ? "#fdfaf2" : "#1b2238",
+                        color: on ? su.color : "#8a93a8",
+                      }}
+                    >
+                      {su.sym}
+                    </button>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          {wilds.length > 0 && (
+            <button style={{ ...chip(false), marginTop: 4 }} onClick={() => setWilds([])}>Clear wilds (no wild cards)</button>
+          )}
+
+          <button style={btn("#ff5c8a")} onClick={createGame} disabled={busy}>
+            {busy ? "Setting up…" : "Create game & get code"}
+          </button>
+          <button style={btn("#3a4152")} onClick={() => setScreen("home")}>Back</button>
+          {msg && <div style={{ color: "#ffd447", marginTop: 10 }}>{msg}</div>}
+        </div>
+      </div>
+    );
+  }
+
+  /* ================= JOIN ================= */
+  if (screen === "join")
+    return (
+      <div style={page}>
+        <Header />
+        <div style={cardBox}>
+          <div style={{ fontWeight: 800, marginBottom: 10 }}>Join a game</div>
+          <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 6 }}>4-character game code from the host's phone</div>
+          <input
+            style={{ ...input, textTransform: "uppercase", letterSpacing: 6, fontSize: 24, textAlign: "center" }}
+            value={joinCode}
+            onChange={(e) => setJoinCode(e.target.value)}
+            maxLength={4}
+            placeholder="ABCD"
+          />
+          <button style={btn("#2f6fed")} onClick={joinGame} disabled={busy}>
+            {busy ? "Joining…" : "Join game"}
+          </button>
+          <button style={btn("#3a4152")} onClick={() => setScreen("home")}>Back</button>
+          {msg && <div style={{ color: "#ffd447", marginTop: 10 }}>{msg}</div>}
+        </div>
+      </div>
+    );
+
+  /* ================= GAME ================= */
+  if (!meta || !me) return <div style={page}>Loading…</div>;
+  const finished = meta.status === "finished";
+  const isHost = meta.hostId === myId;
+  const myBest = bestHand(me.cards, wildSet, meta.rankRule);
+  const winnerRes = finished ? meta.results.find((r) => r.id === meta.winnerId) : null;
+  const iWon = finished && meta.winnerId === myId;
+
+  return (
+    <div style={page}>
+      {iWon && <Fireworks />}
+      <Header />
+
+      {/* code + roster */}
+      <div style={{ ...cardBox, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 12, opacity: 0.6 }}>Game code</div>
+          <div style={{ fontSize: 28, fontWeight: 900, letterSpacing: 5, color: "#ffd447" }}>{code}</div>
+        </div>
+        <div style={{ textAlign: "right", fontSize: 12, opacity: 0.75 }}>
+          {meta.playerIds.length}/{meta.maxPlayers} bowlers · {meta.decks} deck{meta.decks > 1 ? "s" : ""}
+          <br />
+          {meta.wilds.length ? meta.wilds.length + " wild cards" : "No wilds"} ·{" "}
+          {meta.holdMode === "keep12" ? "keep 12" : "hold 5"}
+        </div>
+      </div>
+
+      {/* finished banner */}
+      {finished && (
+        <div style={{ ...cardBox, textAlign: "center", border: iWon ? "2px solid #ffd447" : "1px solid rgba(255,255,255,0.12)" }}>
+          <div style={{ fontSize: 24, fontWeight: 900, color: iWon ? "#ffd447" : "#ff5c8a" }}>
+            {iWon ? "🏆 YOU WIN! 🏆" : "🎳 " + (winnerRes ? winnerRes.name + " wins" : "Game over")}
+          </div>
+          {winnerRes && <div style={{ marginTop: 4, fontSize: 15 }}>{winnerRes.handName}</div>}
+          <div style={{ marginTop: 12, textAlign: "left" }}>
+            {meta.results.map((r, i) => (
+              <div key={r.id} style={{ padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+                <b>{i + 1}. {r.name}</b> — {r.handName}
+                <div style={{ display: "flex", gap: 4, marginTop: 5, flexWrap: "wrap" }}>
+                  {r.five.map((c, j) => (
+                    <PCard key={j} c={c} wild={wildSet.has(key(c))} small />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <button style={btn("#3a4152")} onClick={resetToHome}>Back to start</button>
+        </div>
+      )}
+
+      {/* ball buttons */}
+      {!finished && (
+        <div style={cardBox}>
+          <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 8 }}>
+            Mark your frame — {totalEarned}/12 cards earned
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <AlleyBtn label="Strike" sub="X · draw a card" color="#e0353f" onClick={() => markBall("strike")} disabled={pendingDiscard} />
+            <AlleyBtn label="Spare" sub="/ · draw a card" color="#e6a417" onClick={() => markBall("spare")} disabled={pendingDiscard} />
+            <AlleyBtn label="Open" sub="— · no card" color="#4a5468" onClick={() => markBall("open")} disabled={pendingDiscard} />
+          </div>
+          {msg && <div style={{ color: "#ffd447", marginTop: 10, fontSize: 14 }}>{msg}</div>}
+        </div>
+      )}
+
+      {/* my hand */}
+      {!finished && (
+        <div style={cardBox}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <div style={{ fontWeight: 800 }}>{me.name}'s hand ({me.cards.length})</div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>
+              X {me.strikes} · / {me.spares} · O {me.opens}
+            </div>
+          </div>
+          {pendingDiscard && (
+            <div style={{ color: "#ff5c8a", fontWeight: 800, margin: "8px 0 2px" }}>
+              Tap a card to discard it, then your new card is dealt
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+            {me.cards.length === 0 && <div style={{ opacity: 0.55, fontSize: 14 }}>No cards yet — go bowl a strike!</div>}
+            {me.cards.map((c, i) => (
+              <PCard key={i} c={c} wild={wildSet.has(key(c))} onClick={pendingDiscard ? () => discardThenDraw(i) : undefined} />
+            ))}
+          </div>
+          {me.cards.length > 0 && (
+            <div style={{ marginTop: 10, fontSize: 14, color: "#7dffa0" }}>Current best: <b>{myBest.name}</b></div>
+          )}
+        </div>
+      )}
+
+      {/* other bowlers */}
+      {!finished && (
+        <div style={cardBox}>
+          <div style={{ fontWeight: 800, marginBottom: 8 }}>Other bowlers</div>
+          {meta.playerIds.filter((p) => p !== myId).length === 0 && (
+            <div style={{ opacity: 0.6, fontSize: 14 }}>Waiting for bowlers — share code <b>{code}</b></div>
+          )}
+          {meta.playerIds
+            .filter((p) => p !== myId)
+            .map((pid) => {
+              const p = others[pid];
+              return (
+                <div key={pid} style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", borderBottom: "1px solid rgba(255,255,255,0.08)", fontSize: 15 }}>
+                  <div>🎳 {p ? p.name : meta.names[pid] || "…"}</div>
+                  <div style={{ opacity: 0.75 }}>
+                    {p ? p.cards.length + " cards · X" + p.strikes + " /" + p.spares + " O" + p.opens : "joining…"}
+                  </div>
+                </div>
+              );
+            })}
+        </div>
+      )}
+
+      {/* host finish */}
+      {!finished && isHost && (
+        <button style={btn("#ffb01f")} onClick={finishGame} disabled={busy}>
+          {busy ? "Scoring…" : "🏁 Finish game & crown the winner"}
+        </button>
+      )}
+      {!finished && !isHost && (
+        <div style={{ textAlign: "center", opacity: 0.55, fontSize: 13, marginTop: 14 }}>
+          The host ({meta.names[meta.hostId]}) ends the game when the night's over.
+        </div>
+      )}
+    </div>
+  );
+}
