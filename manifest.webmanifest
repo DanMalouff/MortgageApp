@@ -1,6 +1,6 @@
 {
-  "name": "Stepdown — Temporary Buydown Calculator",
-  "short_name": "Stepdown",
+  "name": "Mortgage Payment Calculator",
+  "short_name": "Mtg Payment",
   "description": "Mortgage temporary buydown calculator: presets and custom schedules, subsidy cost, seller-credit limits, PITI, and comparisons against points or a price cut.",
   "start_url": "./index.html",
   "scope": "./",

@@ -1,4 +1,4 @@
-const CACHE = "stepdown-v2";
+const CACHE = "stepdown-v3";
 const SHELL = [
   "./",
   "./index.html",
